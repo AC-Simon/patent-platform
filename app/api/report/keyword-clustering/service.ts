@@ -1,17 +1,5 @@
 import { getEmbeddings } from "@/lib/service/embedding";
 
-// 保留 streamClusters 函数接口，但实际上不需要流式传输 AP 结果
-// 如果前端强制需要流式，可以考虑模拟或者返回空流
-export async function streamClusters(params: {
-  keywords: string[];
-}) {
-  // AP 算法不是流式的，这里我们先完整计算，然后一次性返回结果
-  // 或者抛出错误提示不支持流式
-  console.warn("Affinity Propagation algorithm does not support streaming.");
-  const clusters = await generateClusters(params);
-  return JSON.stringify(clusters);
-}
-
 export async function generateClusters(params: {
   keywords: string[];
 }): Promise<any[]> {
@@ -24,13 +12,11 @@ export async function generateClusters(params: {
     // 1. 获取 Embeddings
     const embeddings = await getEmbeddings(keywords);
 
-    // 2. 计算相似度矩阵
-    const similarityMatrix = computeNegativeEuclideanDistance(embeddings);
-
-    // 3. 运行 Affinity Propagation
+    // 2. 运行 Affinity Propagation
     // damping: 0.5, maxIter: 200, convergenceIter: 15
-    const ap = new AffinityPropagation(0.5, 200, 15);
-    ap.fit(similarityMatrix);
+    // 支持 'euclidean' (负欧氏距离) 或 'cosine' (余弦相似度)
+    const ap = new AffinityPropagation(0.5, 200, 15, null, "cosine");
+    ap.fit(embeddings);
 
     const labels = ap.labels;
     const centers = ap.clusterCentersIndices;
@@ -52,16 +38,17 @@ export async function generateClusters(params: {
 
     // 5. 生成结果
     // 根据用户要求，不再使用 LLM 命名，而是简单使用 1, 2, 3 进行命名
-    const results = Array.from(clusterMap.entries()).map(([_, clusterKeywords], index) => {
-      return {
-        id: idCounter++,
-        name: (index + 1).toString(), // 简单的 1, 2, 3 命名
-        keywords: clusterKeywords,
-      };
-    });
+    const results = Array.from(clusterMap.entries()).map(
+      ([_, clusterKeywords], index) => {
+        return {
+          id: idCounter++,
+          name: (index + 1).toString(), // 简单的 1, 2, 3 命名
+          keywords: clusterKeywords,
+        };
+      },
+    );
 
     return results;
-
   } catch (error) {
     console.error("关键词聚类生成时发生错误:", error);
     // 降级处理：全部归为一个组
@@ -75,15 +62,18 @@ export async function generateClusters(params: {
   }
 }
 
+export type AffinityMetric = "euclidean" | "cosine" | "precomputed";
+
 /**
- * Affinity Propagation Clustering Algorithm
- * Re-implemented in TypeScript based on sklearn.cluster.AffinityPropagation
+ * Affinity Propagation 聚类算法
+ * 基于 sklearn.cluster.AffinityPropagation 的 TypeScript 重实现
  */
 export class AffinityPropagation {
   private damping: number;
   private maxIter: number;
   private convergenceIter: number;
   private preference: number | null;
+  private affinity: AffinityMetric;
 
   public clusterCentersIndices: number[] | null = null;
   public labels: number[] | null = null;
@@ -93,7 +83,8 @@ export class AffinityPropagation {
     damping: number = 0.5,
     maxIter: number = 200,
     convergenceIter: number = 15,
-    preference: number | null = null
+    preference: number | null = null,
+    affinity: AffinityMetric = "euclidean",
   ) {
     if (damping < 0.5 || damping >= 1) {
       throw new Error("Damping factor must be between 0.5 and 1");
@@ -102,35 +93,50 @@ export class AffinityPropagation {
     this.maxIter = maxIter;
     this.convergenceIter = convergenceIter;
     this.preference = preference;
+    this.affinity = affinity;
   }
 
-  // Helper to create a matrix of zeros
+  // 创建全零矩阵的辅助函数
   private zeros(rows: number, cols: number): number[][] {
     return Array.from({ length: rows }, () => new Array(cols).fill(0));
   }
 
-  public fit(S: number[][]): this {
+  /**
+   * 拟合聚类模型
+   * @param X 数据矩阵或相似度矩阵（如果 affinity 为 'precomputed'）
+   */
+  public fit(X: number[][]): this {
+    let S: number[][];
+
+    if (this.affinity === "precomputed") {
+      S = X;
+    } else if (this.affinity === "euclidean") {
+      S = AffinityPropagation.computeNegativeEuclideanDistance(X);
+    } else if (this.affinity === "cosine") {
+      S = AffinityPropagation.computeCosineSimilarity(X);
+    } else {
+      throw new Error(`Unknown affinity metric: ${this.affinity}`);
+    }
+
     const nSamples = S.length;
     if (nSamples === 0) return this;
 
-    // Initialize preference if needed
+    // 如果需要，初始化偏好值 (preference)
     let preferenceValue = this.preference;
     if (preferenceValue === null) {
       const flatS = S.flat();
       flatS.sort((a, b) => a - b);
       const mid = Math.floor(flatS.length / 2);
       preferenceValue =
-        flatS.length % 2 !== 0
-          ? flatS[mid]
-          : (flatS[mid - 1] + flatS[mid]) / 2;
+        flatS.length % 2 !== 0 ? flatS[mid] : (flatS[mid - 1] + flatS[mid]) / 2;
     }
 
-    // Apply preference to diagonal
+    // 将偏好值应用到对角线
     const S_matrix = S.map((row, i) =>
-      row.map((val, j) => (i === j ? (preferenceValue as number) : val))
+      row.map((val, j) => (i === j ? (preferenceValue as number) : val)),
     );
 
-    // Initialize messages
+    // 初始化消息矩阵
     let A = this.zeros(nSamples, nSamples);
     let R = this.zeros(nSamples, nSamples);
 
@@ -138,13 +144,13 @@ export class AffinityPropagation {
     const exemplarHistory: string[] = [];
 
     for (let it = 0; it < this.maxIter; it++) {
-      // 1. Compute Responsibilities (R)
+      // 1. 计算归属度 (Responsibility, R)
       // r(i, k) <- s(i, k) - max_{k' != k} { a(i, k') + s(i, k') }
 
-      // Precompute AS = A + S
+      // 预计算 AS = A + S
       const AS = S_matrix.map((row, i) => row.map((val, j) => val + A[i][j]));
 
-      // Find max values for each row
+      // 寻找每行的最大值
       const maxAS = new Array(nSamples).fill(-Infinity);
       const maxIdxs = new Array(nSamples).fill(-1);
       const secondMaxAS = new Array(nSamples).fill(-Infinity);
@@ -161,7 +167,7 @@ export class AffinityPropagation {
         }
       }
 
-      // Update R
+      // 更新 R
       const R_new = this.zeros(nSamples, nSamples);
 
       for (let i = 0; i < nSamples; i++) {
@@ -173,17 +179,17 @@ export class AffinityPropagation {
       }
       R = R_new;
 
-      // 2. Compute Availabilities (A)
+      // 2. 计算可用度 (Availability, A)
       // a(i, k) <- min(0, r(k, k) + sum_{i' not in {i, k}} max(0, r(i', k))) for i != k
       // a(k, k) <- sum_{i' != k} max(0, r(i', k))
 
       const A_new = this.zeros(nSamples, nSamples);
 
-      // Calculate sum of positive responsibilities for each column (excluding diagonal)
+      // 计算每列正归属度的和 (不包括对角线)
       // Rp = max(0, R)
       // Rp[diagonal] = 0
       const Rp = R.map((row, i) =>
-        row.map((val, j) => (i === j ? 0 : Math.max(0, val)))
+        row.map((val, j) => (i === j ? 0 : Math.max(0, val))),
       );
       const Rp_sum = new Array(nSamples).fill(0);
       for (let k = 0; k < nSamples; k++) {
@@ -210,8 +216,8 @@ export class AffinityPropagation {
       }
       A = A_new;
 
-      // Check convergence
-      // Identify exemplars: i where R(i, i) + A(i, i) > 0
+      // 检查是否收敛
+      // 识别聚类中心: i where R(i, i) + A(i, i) > 0
       const currentExemplars: number[] = [];
       for (let i = 0; i < nSamples; i++) {
         if (A[i][i] + R[i][i] > 0) {
@@ -226,9 +232,7 @@ export class AffinityPropagation {
       }
 
       if (exemplarHistory.length === this.convergenceIter) {
-        const allSame = exemplarHistory.every(
-          (e) => e === exemplarHistory[0]
-        );
+        const allSame = exemplarHistory.every((e) => e === exemplarHistory[0]);
         if (allSame) {
           convergenceCount++;
         } else {
@@ -242,27 +246,27 @@ export class AffinityPropagation {
       }
     }
 
-    // Final assignments
+    // 最终分配
     const E = A.map((row, i) => row.map((val, j) => val + R[i][j]));
     const labels = new Array(nSamples).fill(-1);
     const clusterCentersIndices: number[] = [];
 
-    // Find exemplars
+    // 寻找聚类中心 (Exemplars)
     for (let i = 0; i < nSamples; i++) {
       if (E[i][i] > 0) {
         clusterCentersIndices.push(i);
       }
     }
 
-    // Assign labels
+    // 分配标签
     if (clusterCentersIndices.length > 0) {
       for (let i = 0; i < nSamples; i++) {
-        // Find the exemplar k that maximizes similarity
+        // 找到使相似度最大化的聚类中心 k
         let maxSim = -Infinity;
         let bestExemplar = -1;
-        
-        // Strategy: Assign to the exemplar with max S(i, exemplar)
-        // This is standard AP refinement step
+
+        // 策略: 分配给 max S(i, exemplar) 的聚类中心
+        // 这是标准的 AP 细化步骤
         for (const exemplarIdx of clusterCentersIndices) {
           const sim = S[i][exemplarIdx];
           if (sim > maxSim) {
@@ -273,7 +277,7 @@ export class AffinityPropagation {
         labels[i] = bestExemplar;
       }
 
-      // Remap labels to 0..n_clusters-1
+      // 将标签重映射到 0..n_clusters-1
       const uniqueLabels = Array.from(new Set(labels)).sort((a, b) => a - b);
       const labelMap = new Map();
       uniqueLabels.forEach((l, idx) => labelMap.set(l, idx));
@@ -286,34 +290,73 @@ export class AffinityPropagation {
 
     return this;
   }
-}
 
-/**
- * Helper to compute Negative Euclidean Distance Squared matrix
- * @param X Data matrix (n_samples x n_features)
- */
-export function computeNegativeEuclideanDistance(X: number[][]): number[][] {
-  const nSamples = X.length;
-  if (nSamples === 0) return [];
-  const nFeatures = X[0].length;
-  const S = Array.from({ length: nSamples }, () => new Array(nSamples).fill(0));
+  /**
+   * 计算负欧氏距离平方矩阵的辅助函数
+   * @param X 数据矩阵 (n_samples x n_features)
+   */
+  public static computeNegativeEuclideanDistance(X: number[][]): number[][] {
+    const nSamples = X.length;
+    if (nSamples === 0) return [];
+    const nFeatures = X[0].length;
+    const S = Array.from({ length: nSamples }, () =>
+      new Array(nSamples).fill(0),
+    );
 
-  for (let i = 0; i < nSamples; i++) {
-    for (let j = 0; j < nSamples; j++) {
-      if (i === j) {
-        S[i][j] = 0; // Distance is 0, so negative distance is -0 = 0
-        // Wait, AP usually uses negative squared euclidean distance.
-        // d(x,y) = ||x-y||^2. S = -d.
-        // Self similarity is usually preference, but here we compute raw distance.
-      } else {
-        let sumSq = 0;
-        for (let k = 0; k < nFeatures; k++) {
-          const diff = X[i][k] - X[j][k];
-          sumSq += diff * diff;
+    for (let i = 0; i < nSamples; i++) {
+      for (let j = 0; j < nSamples; j++) {
+        if (i === j) {
+          S[i][j] = 0;
+        } else {
+          let sumSq = 0;
+          for (let k = 0; k < nFeatures; k++) {
+            const diff = X[i][k] - X[j][k];
+            sumSq += diff * diff;
+          }
+          S[i][j] = -sumSq;
         }
-        S[i][j] = -sumSq;
       }
     }
+    return S;
   }
-  return S;
+
+  /**
+   * 计算余弦相似度矩阵的辅助函数
+   * @param X 数据矩阵 (n_samples x n_features)
+   */
+  public static computeCosineSimilarity(X: number[][]): number[][] {
+    const nSamples = X.length;
+    if (nSamples === 0) return [];
+    const nFeatures = X[0].length;
+    const S = Array.from({ length: nSamples }, () =>
+      new Array(nSamples).fill(0),
+    );
+
+    // 预计算向量模长
+    const magnitudes = new Array(nSamples).fill(0);
+    for (let i = 0; i < nSamples; i++) {
+      let sumSq = 0;
+      for (let k = 0; k < nFeatures; k++) {
+        sumSq += X[i][k] * X[i][k];
+      }
+      magnitudes[i] = Math.sqrt(sumSq);
+    }
+
+    for (let i = 0; i < nSamples; i++) {
+      for (let j = 0; j < nSamples; j++) {
+        if (i === j) {
+          S[i][j] = 1.0; // 自身相似度为 1
+        } else {
+          let dotProduct = 0;
+          for (let k = 0; k < nFeatures; k++) {
+            dotProduct += X[i][k] * X[j][k];
+          }
+          const denom = magnitudes[i] * magnitudes[j];
+          // 避免除以零
+          S[i][j] = denom === 0 ? 0 : dotProduct / denom;
+        }
+      }
+    }
+    return S;
+  }
 }

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { streamClusters, generateClusters } from "./service";
+import { generateClusters } from "./service";
 
 export const dynamic = "force-dynamic";
 
